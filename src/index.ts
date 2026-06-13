@@ -7,64 +7,108 @@ export default {
         const url = new URL(request.url);
         const { pathname } = url;
 
-        // 1. API de Cotización
+        // 1. API de Cotización Inteligente
         if (request.method === "POST" && pathname === "/api/cotizar") {
             try {
                 const { consumo, modalidad, paneles, baterias } = await request.json();
-                const pPanel = 750000;
-                const pBat = 9500000;
-                const pInv = modalidad === 'on-grid' ? 4800000 : 6500000;
+                
+                // Precios de ingeniería (Mock para producción)
+                const pPanel = 780000; // 550W Tier 1
+                const pBat = 9200000;  // Litio 5kWh
+                const pInv = modalidad === 'on-grid' ? 4500000 : 6800000;
 
                 let costoEquipos = (paneles * pPanel) + (baterias * pBat) + pInv;
                 if (modalidad === 'respaldo') costoEquipos -= (paneles * pPanel);
-                const costoInstalacion = costoEquipos * 0.20; 
+                
+                const costoInstalacion = costoEquipos * 0.18; 
                 const total = costoEquipos + costoInstalacion;
-                const generacionMensual = paneles * 66; 
-                const ahorroMensual = Math.min(generacionMensual, consumo) * 850; 
+                
+                // Métricas Energéticas
+                const generacionKwh = paneles * 68.5; // Promedio kWh/mes por panel
+                const cobertura = Math.min(100, (generacionKwh / (consumo || 1)) * 100);
+                const ahorroMensual = Math.min(generacionKwh, consumo || 0) * 880; // COP/kWh
                 const roi = ahorroMensual > 0 ? (total / (ahorroMensual * 12)).toFixed(1) : "---";
 
                 return new Response(JSON.stringify({
-                    total_equipos: costoEquipos,
-                    total_instalacion: costoInstalacion,
                     total_cotizacion: total,
-                    roi_anios: roi
+                    roi_anios: roi,
+                    generacion_kwh: Math.round(generacionKwh),
+                    cobertura_porcentaje: Math.round(cobertura),
+                    ahorro_mensual: Math.round(ahorroMensual),
+                    ahorro_anual: Math.round(ahorroMensual * 12),
+                    paneles_sugeridos: paneles,
+                    baterias_sugeridas: baterias
                 }), { headers: { "Content-Type": "application/json" } });
             } catch (err) {
                 return new Response(JSON.stringify({ error: err.message }), { status: 500 });
             }
         }
 
-        // 2. API: Enviar a n8n para WhatsApp/Email
-        if (request.method === "POST" && pathname === "/api/enviar-pdf") {
+        // 2. API: Guardar Lead y Cotización en Supabase
+        if (request.method === "POST" && pathname === "/api/guardar-lead") {
             try {
                 const data = await request.json();
+                const { nombre, email, whatsapp, consumo, modalidad, paneles, baterias, total, roi, generacion, ahorro, cobertura } = data;
+
+                const supabaseUrl = env.SUPABASE_URL;
+                const supabaseKey = env.SUPABASE_KEY;
+
+                // 2a. Upsert Cliente (basado en email como identificador único)
+                const resCliente = await fetch(`${supabaseUrl}/rest/v1/clientes`, {
+                    method: 'POST',
+                    headers: {
+                        'apikey': supabaseKey,
+                        'Authorization': `Bearer ${supabaseKey}`,
+                        'Content-Type': 'application/json',
+                        'Prefer': 'return=representation,resolution=merge-duplicates'
+                    },
+                    body: JSON.stringify({
+                        nombre,
+                        email,
+                        whatsapp,
+                        whatsapp_id: whatsapp // Para compatibilidad con esquema anterior
+                    })
+                });
                 
-                // Si no hay URL de webhook configurada, devolvemos éxito simulado para que no de error 500
-                const N8N_WEBHOOK_URL = env.N8N_WEBHOOK_URL;
+                const clientes = await resCliente.json();
+                const clienteId = clientes[0]?.id;
 
-                if (N8N_WEBHOOK_URL && N8N_WEBHOOK_URL !== "https://tu-n8n.com/webhook/cotizacion") {
-                    await fetch(N8N_WEBHOOK_URL, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(data)
-                    });
-                } else {
-                    console.log("Simulando envío: No hay Webhook de n8n configurado aún.");
-                }
+                if (!clienteId) throw new Error("Error al crear/obtener cliente");
 
-                return new Response(JSON.stringify({ success: true, message: "Datos procesados" }), {
+                // 2b. Insertar Cotización
+                await fetch(`${supabaseUrl}/rest/v1/cotizaciones`, {
+                    method: 'POST',
+                    headers: {
+                        'apikey': supabaseKey,
+                        'Authorization': `Bearer ${supabaseKey}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        cliente_id: clienteId,
+                        consumo_kwh: consumo,
+                        num_paneles: paneles,
+                        capacidad_bateria_kwh: baterias * 5.12, // Asumiendo capacidad estándar
+                        modalidad,
+                        total_cotizacion: total,
+                        generacion_kwh: generacion,
+                        ahorro_mensual: ahorro,
+                        roi_anios: parseFloat(roi),
+                        cobertura_porcentaje: cobertura
+                    })
+                });
+
+                return new Response(JSON.stringify({ success: true, message: "Lead guardado correctamente" }), {
                     headers: { "Content-Type": "application/json" }
                 });
             } catch (err) {
-                // Evitar error 500 si el webhook falla, para que el cliente igual descargue su PDF
                 return new Response(JSON.stringify({ success: false, error: err.message }), { 
-                    status: 200, // Devolvemos 200 pero con success false para manejo interno
+                    status: 500,
                     headers: { "Content-Type": "application/json" } 
                 });
             }
         }
 
-        // 3. Servir Assets desde KV
+        // 3. Servir Assets
         try {
             return await getAssetFromKV(
                 { request, waitUntil: ctx.waitUntil.bind(ctx) },
@@ -72,9 +116,7 @@ export default {
             );
         } catch (e) {
             if (pathname === "/") {
-                return new Response(env.FRONTEND_HTML, {
-                    headers: { "Content-Type": "text/html;charset=UTF-8" },
-                });
+                return new Response("Use public/index.html", { status: 200 });
             }
             return new Response("Not Found", { status: 404 });
         }
